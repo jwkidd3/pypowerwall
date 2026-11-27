@@ -114,7 +114,7 @@ def _release_tuple(version_string):
 # Single source of truth for the package version — keep this a plain literal.
 # pyproject.toml reads it at build time via [tool.setuptools.dynamic]
 # (attr:), which parses this file without importing it.
-__version__ = version = "0.23.0"
+__version__ = version = "0.25.0"
 version_tuple = _release_tuple(__version__)
 __author__ = 'jasonacox'
 
@@ -240,6 +240,7 @@ class Powerwall(object):
         self.client: Optional[PyPowerwallBase] = None
         self.fleetapi = fleetapi
         self.retry_modes = retry_modes
+        self._connect_error = None  # First connect() failure: the configured mode's (#373)
         self.failover = failover  # False: configured mode/transport only (no fallback)
         self.wifi_v1r_fallback = bool(wifi_v1r_fallback)
         self.mode = "unknown"
@@ -299,8 +300,13 @@ class Powerwall(object):
 
         # Connect to Powerwall
         if not self.connect(self.retry_modes):
-            log.error("Unable to connect to Powerwall. Verify host, credentials, and network connectivity."
-                     " Enable debug logging for detailed diagnostics.")
+            # Name the configured mode's own failure: with failover on, the modes tried
+            # after it fail for unrelated reasons (no cloud auth file, no FleetAPI
+            # config), and a config error such as a missing RSA key or the v1r/bearer
+            # mutual exclusion is otherwise only visible in an earlier warning (#373).
+            reason = f" ({self._connect_error})" if self._connect_error else ""
+            log.error(f"Unable to connect to Powerwall{reason}. Verify host, credentials, and network connectivity."
+                      " Enable debug logging for detailed diagnostics.")
 
     def connect(self, retry=False) -> bool:
         """
@@ -308,9 +314,9 @@ class Powerwall(object):
 
         Tries the configured mode first and, when failover is on (the
         default), falls back to the other modes (local -> fleetapi -> cloud ->
-        local) on failure. If every mode fails, the configured mode is restored
-        so a later connect() retries in the configured order. With
-        failover=False only the configured mode is tried.
+        local) on failure. Every call starts from the configured mode; if
+        every mode fails, the client, mode and TEDAPI state it started with
+        are kept. With failover=False only the configured mode is tried.
 
         Args:
             retry = If True, keep cycling through the modes (only the configured
@@ -322,19 +328,29 @@ class Powerwall(object):
         if self.mode == "unknown":
             log.error("Unable to determine mode to connect.")
             return False
+        # Snapshot the state this call starts with - the client together with
+        # the mode and TEDAPI state it runs in - for a total failure to put
+        # back. Fallback replaces the client with each mode's attempt and
+        # mutates the rest. Leaving the last attempt (an unauthenticated cloud
+        # client) made a local-only install raise
+        # PyPowerwallCloudTeslaNotConnected until the next successful connect
+        # (#454), and pairing the kept client with another mode would report
+        # one mode while serving another. tedapi/tedapi_mode matter as much as
+        # mode: the local-mode exception handler zeroes them, and a stale
+        # tedapi=False after a fully-failed connect(retry=False) wedged the
+        # proxy's TEDAPI recovery thread forever - its loop gate
+        # (`if not pw.tedapi: continue`) never reached the reconnect call
+        # again (#366).
+        previous = (self.client, self.mode, self.cloudmode, self.fleetapi,
+                    self.tedapi, self.tedapi_mode)
         # Start from the mode set at construction, not where a successful
         # failover left it: after local -> cloud, a reconnect must try local
         # again first, or recovery can never get back to the gateway (#424).
         self.mode, self.cloudmode, self.fleetapi = self._configured_mode
-        # Snapshot the configured mode - fallback mutates self.mode/cloudmode/
-        # fleetapi/tedapi/tedapi_mode, and a total failure must not leave that
-        # mutation behind. tedapi/tedapi_mode matter as much as mode: the local-
-        # mode exception handler zeroes them, and a stale tedapi=False after a
-        # fully-failed connect(retry=False) wedged the proxy's TEDAPI recovery
-        # thread forever - its loop gate (`if not pw.tedapi: continue`) never
-        # reached the reconnect call again (#366).
+        # Strict-mode retries (failover off) restart from here
         configured_mode = (self.mode, self.cloudmode, self.fleetapi,
                            self.tedapi, self.tedapi_mode)
+        self._connect_error = None
         total_wait = 0
         count = 0
         while count < 3:
@@ -411,6 +427,7 @@ class Powerwall(object):
                         self.tedapi_mode = "off"
                     return True
                 except Exception as exc:
+                    self._note_connect_error("local", exc)
                     log.warning(f"Failed to connect using Local mode: {exc}"
                                 + (" - trying fleetapi mode." if self.failover else ""))
                     self.tedapi = False
@@ -430,6 +447,7 @@ class Powerwall(object):
                     self.siteid = self.client.siteid
                     return True
                 except Exception as exc:
+                    self._note_connect_error("fleetapi", exc)
                     log.warning(f"Failed to connect using FleetAPI mode: {exc}"
                                 + (" - trying cloud mode." if self.failover else ""))
                     self.mode = "cloud"
@@ -445,15 +463,23 @@ class Powerwall(object):
                     self.siteid = self.client.siteid
                     return True
                 except Exception as exc:
+                    self._note_connect_error("cloud", exc)
                     log.warning(f"Failed to connect using Cloud mode: {exc}"
                                 + (" - trying local mode." if self.failover else ""))
                     self.mode = "local"
                     continue
-        # Total failure - restore the configured mode so a subsequent
-        # connect() retries in the configured order, not where fallback left off
+        # Total failure - put the starting state back. A first connect has no
+        # client to keep, so its last attempt stays as before.
+        if previous[0] is not None:
+            self.client = previous[0]
         (self.mode, self.cloudmode, self.fleetapi,
-         self.tedapi, self.tedapi_mode) = configured_mode
+         self.tedapi, self.tedapi_mode) = previous[1:]
         return False
+
+    def _note_connect_error(self, mode: str, exc: Exception) -> None:
+        """Keep the first connect() failure, i.e. the configured mode's, for the final error."""
+        if self._connect_error is None:
+            self._connect_error = f"{mode} mode: {exc}"
 
     def _no_client(self) -> bool:
         """Return True (and log an error) if no backend client is connected."""
@@ -562,7 +588,8 @@ class Powerwall(object):
         Battery Level Percentage 
             Note: Tesla App reserves 5% of battery => ( (batterylevel / 0.95) - (5 / 0.95) )
         Args:
-            scale = If True, convert battery level to app scale value
+            scale = If True, convert battery level to app scale value (never below 0,
+                    like the Tesla App, when the battery dips under the 5% reserve)
         """
         # Return power level percentage for battery
         try:
@@ -570,7 +597,10 @@ class Powerwall(object):
             if payload is not None and 'percentage' in payload:
                 level = payload['percentage']
                 if scale:
-                    level = (level / 0.95) - (5 / 0.95)
+                    # Self-consumption can take the battery under the 5% reserve
+                    # (seen at 3.9%), where the formula goes negative; the Tesla
+                    # App shows 0%, as get_reserve() already does
+                    level = max(0.0, (level / 0.95) - (5 / 0.95))
                 return level
             return None
         except Exception as e:
@@ -1074,7 +1104,8 @@ class Powerwall(object):
                 log.warning(f"Unable to parse payload '{payload}' for grid_status of output_type: {output_type}")
             return status
         except Exception as e:
-            log.error(f"grid_status(): Exception {type(e).__name__}: {e}")
+            # `type` is the deprecated parameter here, not the builtin
+            log.error(f"grid_status(): Exception {e.__class__.__name__}: {e}")
             raise
 
     def system_status(self, jsonformat=False) -> Optional[Union[dict, str]]:

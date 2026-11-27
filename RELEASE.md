@@ -1,5 +1,42 @@
 # RELEASE NOTES
 
+## v0.25.0 - Generator Aggregates and Powerwall 2 Gateway Uptime
+
+Two TEDAPI/v1r gaps closed by @clonea1 in their first contributions, both found and hardware-tested on a Backup Gateway 2 with 2x Powerwall 2 and a standby generator. Thank you @clonea1, @cavedon for reporting #418, and @jasonacox-sam for verifying #472 and reviewing both! (Minor bump: `/api/meters/aggregates` gains a `generator` section.)
+
+* feat(tedapi): `/api/meters/aggregates` (and the proxy's `/aggregates`) has a `generator` section again in TEDAPI/v1r mode, so dashboards that store `generator_*` no longer go flat after switching from local mode. It appears only when `config.json` declares a generator meter, since meterAggregates lists `GENERATOR` (0 W) on sites without one too. `instant_power` comes from meterAggregates, and lifetime energy from the gateway's native `/api/meters/aggregates` when it serves a generator section (#221). Thanks @clonea1 (#472, #473).
+* fix(tedapi): `/api/status` fills `start_time` and `up_time_seconds` from the gateway's native `/api/status` (customer login) when `SYNC_Uptime` isn't usable. A Backup Gateway 2 with Powerwall 2s (firmware 26.34.2) lists the signal but leaves it null, so both stayed `null` after #419. Sites where `SYNC_Uptime` works are unchanged. New `TEDAPI.get_native_status()`, cached and backed off like the native aggregates merge (#221). Thanks @clonea1 (#418, #474).
+* chore(tools): `tools/requirements-tools.txt` comments no longer contain requirement-like text, which GitHub's dependency graph read as an old `protobuf` pin and flagged in a Dependabot alert. No change to what installs. (#471)
+* Library version bumped to `0.25.0`
+
+## v0.24.0 - Visible TEDAPI Stalls
+
+One fix for the second gap in #454, reported by @llamakarma: a gateway that stalls while holding a TEDAPI lock no longer looks healthy forever. Thanks @llamakarma for the detailed report, and @jasonacox-sam for the hardware stall tests on a Powerwall 3.
+
+* fix(tedapi): when a TEDAPI read times out waiting for its API lock, it now serves cached data only while it is recent: younger than 10x the cache expiry, and at least 60 s (60 s with the defaults). Older data gives `None`, the documented failure value. Before, data of any age was served, so a stuck call kept `version()` answering and the proxy's TEDAPI probe never triggered recovery (#454). **Behavior change:** while a gateway stays stalled for over a minute, pollers get gaps instead of frozen values. (#468)
+* Library version bumped to `0.24.0`
+
+## v0.23.2 - Energy Counter and Error Handling Fixes
+
+Three fixes: one from @wit3 (Salvatore Scalzi), found on his Powerwall 3 with a Backup Gateway 2, and two from new contributor @kochj23 (Jordan Koch). Thank you both!
+
+* fix(tedapi): the lifetime `energy_imported` / `energy_exported` values in `/api/meters/aggregates` no longer drop to 0 for one poll when a fetch of the gateway's local API fails. The failed fetch now serves the last good payload, as the 5-minute retry backoff already did. Home Assistant read the N → 0 → N dip as a meter reset and counted a Powerwall 3's whole battery lifetime (about 4.6 MWh charged, 4.5 MWh discharged) as new energy. Gateways where the endpoint has never answered still get 0s. (#463, follow-up to #221)
+* fix: `grid_status()` re-raises the backend's exception again. Its error log called `type(e)`, which the deprecated `type` argument shadows, so callers got a `TypeError` and the log line was never written. (#464)
+* fix(local): a failed re-login after an expired session (HTTP 401/403) no longer raises out of `poll()` / `post()`. Reads such as `level()` and `power()` return `None` and log the cause, as the read contract requires. `authenticate()` still raises, so `connect()` can fall back to another mode. (#465)
+* Library version bumped to `0.23.2`
+
+## v0.23.1 - Reconnect, macOS Login and Battery Level Fixes
+
+Six fixes and doc updates from new contributor @wit3 (Salvatore Scalzi), each found and verified on his Powerwall 3 with a Backup Gateway 2 (firmware 26.34.2). Thank you!
+
+* fix(auth): cap Tesla auth TLS to 1.2 on macOS too, not only on Windows. On macOS (Homebrew Python 3.14.6, OpenSSL 3.6.3) a token refreshed under TLS 1.3 comes back "tainted": `/api/1/products` answers `403 forbidden` over both TLS 1.2 and 1.3, so `register` stops at site discovery. Refreshing the same account under TLS 1.2 gives a token that gets `200` over both; reproduced twice back to back. `_httpx_auth_verify()` (in `tesla_auth.py` and the vendored teslapy) and `v1r_register._ssl_ctx()` now apply the TLS 1.2 cap on `darwin` as well; Linux keeps the TLS 1.3 pin. (#455, #350)
+* fix(connect): the final `Unable to connect to Powerwall` error now says why the configured mode failed, e.g. `(local mode: RSA private key not found at ...)` or `(local mode: v1r mode requires password or gw_pwd)`. With failover on, the modes tried afterwards fail for unrelated reasons (`No sites found for nobody@nowhere.com`, a missing `.pypowerwall.auth`), and the real cause was only in an earlier fallback warning. Log text only: `connect()` still returns `False` and the fallback order is unchanged. (#457, #373)
+* fix(connect): a reconnect that fails in every mode now keeps the client it had, together with the mode and TEDAPI state it runs in (after a failover to cloud, that is the cloud client in cloud mode). Before, the last fallback attempt was left behind, usually an unauthenticated cloud client, so a local-only install raised `PyPowerwallCloudTeslaNotConnected` on every call until the gateway came back, even though it never uses cloud. Calls during an outage now fail the same way as before it started. The first connect is unchanged. (#458, #454)
+* fix: `level(scale=True)` no longer goes negative when the battery drops under Tesla's 5% reserve, which self-consumption can do (a Powerwall 3 reached 3.9% raw, so -1.1% on the app scale). It now stops at 0.0%, like the Tesla App, `get_reserve()` and pypowerwall-server. The raw `level()` is unchanged. This also covers the proxy's scaled `/api/system_status/soe`. (#460)
+* docs(v1r): the physical proof step now says which control on the Powerwall 3 to use. The On/Off switch is the small black rocker under the flap on the left side. It is not the large red rotary knob on the right side, which on units that have one is the solar DC isolator: turning it off stops only solar production, and the key stays in state 1. Updated in the README and in the `register` prompt, with a second timing data point (VERIFIED about 3 minutes after registration). (#456)
+* docs(v1r): v1r also works on the Powerwall 3's address as a client of the home Wi-Fi, not only on its wired address, with the same DIN and data on both. The requirements no longer say a wired vendor-subnet connection is needed. On Backup Gateway 2 sites, `gw_pwd` is the password on the Powerwall 3's QR label; the gateway's own label password gets a 401. (#459, part of #387)
+* Library version bumped to `0.23.1`
+
 ## v0.23.0 - Proxy HTTPS Certificates and Dispatch Warranty Warning
 
 * fix(proxy): `PW_HTTPS=yes` starts again in Docker (images since v0.15.0 left out the bundled `localhost.pem`), with an HTTPS-aware health check. New `PW_HTTPS_CERT` / `PW_HTTPS_KEY` use your own certificate, as in pypowerwall-server; the shared bundled certificate stays the default and now logs a warning. Proxy t110. (#449)

@@ -1,5 +1,34 @@
 ## pyPowerwall Proxy Release Notes
 
+### Proxy t115 (11 Nov 2026)
+
+* `/pod` status flags (`POD_ActiveHeating`, `POD_ChargeComplete`, `POD_ChargeRequest`, `POD_DischargeComplete`, `POD_PermanentlyFaulted`, `POD_PersistentlyFaulted`, `POD_enable_line`) are `null` when the gateway gives no value, instead of `0`. TEDAPI/v1r vitals have no source for them, so the `0` read like a measured "not faulted" (#179). Values the gateway does report are unchanged. Telegraf skips `null` fields, and no Powerwall-Dashboard panel uses these flags.
+
+### Proxy t114 (9 Nov 2026)
+
+* Upgraded to pyPowerwall v0.25.0 - see the library release notes. Proxy-visible changes, both in TEDAPI/v1r modes:
+  * `/aggregates` and `/api/meters/aggregates` include a `generator` section again when the gateway config declares a generator meter, so Dashboard's `generator_*` fields fill in after switching from local mode. Other sites are unchanged (#473).
+  * `/api/status` reports `start_time` and `up_time_seconds` on gateways that leave `SYNC_Uptime` null, such as a Backup Gateway 2 with Powerwall 2s, by reading the gateway's native `/api/status` (#474).
+
+### Proxy t113 (8 Nov 2026)
+
+* Upgraded to pyPowerwall v0.24.0 - see the library release notes. Proxy-visible change:
+  * When a TEDAPI read times out waiting for its API lock, the library serves its cached data only while it is under a minute old (with default settings), then fails. After the proxy's own `PW_CACHE_TTL` cache (30 s by default) also runs out, endpoints report the gap (`null`, or `0` in the CSV routes) instead of frozen values, and the TEDAPI probe can run recovery. Before, a gateway that stalled while holding the lock could look healthy forever (#468, #454).
+
+### Proxy t112 (7 Nov 2026)
+
+* Upgraded to pyPowerwall v0.23.2 - see the library release notes. Proxy-visible changes:
+  * In TEDAPI modes, the lifetime `energy_imported` / `energy_exported` values in `/aggregates` and `/api/meters/aggregates` no longer drop to 0 for one poll when the gateway's local API fetch fails. Home Assistant read that dip as a meter reset (#463).
+  * In local mode, a failed re-login after the gateway session expires logs an error naming the cause, such as a rejected password, instead of a generic `Unexpected error ... LoginError` warning on each request (#465).
+  * A `grid_status()` failure is logged with its real exception, not a `TypeError` (#464).
+
+### Proxy t111 (30 Oct 2026)
+
+* Upgraded to pyPowerwall v0.23.1 - see the library release notes. Proxy-visible changes:
+  * `/api/system_status/soe` (the Tesla App scale) no longer goes negative when the battery drops under the 5% reserve; it stops at `0.0`, like the Tesla App (#460).
+  * After a failover to cloud, a TEDAPI recovery attempt that fails in every mode keeps the working cloud connection (and `/stats` keeps `cloudmode: true`), instead of leaving an unauthenticated client that failed every call (#458, #454).
+  * When the proxy can't connect at startup, the final error names why the configured mode failed, e.g. a missing RSA key (#457, #373).
+
 ### Proxy t110 (28 Oct 2026)
 
 * Upgraded to pyPowerwall v0.23.0 - see the library release notes.
